@@ -40,9 +40,13 @@ use crate::WebSocketTlsMode;
 #[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
     let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-    let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
+    let mut request = format!("ws://localhost:{}/v1/responses", target_addr.port())
         .into_client_request()
         .expect("websocket request should build");
+    request.headers_mut().insert(
+        "thread-id",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("public-default-monitor"),
+    );
     let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
     let connector = WebSocketConnector::new(&factory).expect("connector should build");
 
@@ -69,9 +73,13 @@ async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
 #[tokio::test]
 async fn public_connector_enables_tcp_nodelay_when_requested() {
     let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
-    let request = format!("ws://localhost:{}/v1/responses", target_addr.port())
+    let mut request = format!("ws://localhost:{}/v1/responses", target_addr.port())
         .into_client_request()
         .expect("websocket request should build");
+    request.headers_mut().insert(
+        "thread-id",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("public-default-monitor"),
+    );
     let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
     let connector = WebSocketConnector::new(&factory)
         .expect("connector should build")
@@ -182,6 +190,15 @@ async fn tungstenite_default_tls_mode_subprocess_probe() {
 
 #[tokio::test]
 async fn direct_route_connects_secure_websocket() {
+    assert_observed_tls_route(OutboundProxyRoute::Direct, "direct-tls-monitor").await;
+}
+
+#[tokio::test]
+async fn default_route_observes_secure_websocket() {
+    assert_observed_tls_route(OutboundProxyRoute::TransportDefault, "default-tls-monitor").await;
+}
+
+async fn assert_observed_tls_route(route: OutboundProxyRoute, thread_id: &'static str) {
     let (tls_config, acceptor, _) = test_tls_configs();
     let (target_addr, target_task) = start_tls_websocket_server(acceptor).await;
     let request = format!("wss://localhost:{}/v1/responses", target_addr.port())
@@ -191,14 +208,14 @@ async fn direct_route_connects_secure_websocket() {
     let mut monitor_headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
     monitor_headers.insert(
         "thread-id",
-        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("direct-tls-monitor"),
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(thread_id),
     );
     let monitor = Probe::from_headers(&monitor_headers, "wss://localhost", "WebSocket");
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
         Some(tls_config),
-        OutboundProxyRoute::Direct,
+        route,
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
         &monitor,
@@ -206,7 +223,7 @@ async fn direct_route_connects_secure_websocket() {
     .await
     .expect("direct websocket handshake should succeed");
     if monitor.active() {
-        let observed = codex_http_client::network_monitor::snapshot("direct-tls-monitor").unwrap();
+        let observed = codex_http_client::network_monitor::snapshot(thread_id).unwrap();
         assert_eq!(observed.phase, Phase::Upgrade);
         assert!(observed.tls.contains("TLSv1_3"));
         assert!(observed.tcp.contains("127.0.0.1") || observed.tcp.contains("[::1]"));
@@ -289,6 +306,12 @@ async fn no_proxy_subprocess_probe() {
         } else {
             test_tls_configs().0
         };
+    let mut headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+    headers.insert(
+        "thread-id",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("no-proxy-monitor"),
+    );
+    let monitor = Probe::from_headers(&headers, "wss://localhost", "WebSocket");
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
@@ -299,7 +322,7 @@ async fn no_proxy_subprocess_probe() {
         },
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
-        &Probe::default(),
+        &monitor,
     )
     .await
     .expect("websocket handshake should succeed");

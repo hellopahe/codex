@@ -51,6 +51,10 @@ pub(crate) async fn connect(
         OutboundProxyRoute::TransportDefault => {
             // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
             // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
+            if monitor.active() {
+                return connect_default_observed(request, config, tls_config, tcp_nodelay, monitor)
+                    .await;
+            }
             let (stream, response) = connect_async_tls_with_config(
                 request,
                 Some(config),
@@ -72,17 +76,27 @@ pub(crate) async fn connect(
             // Let Tungstenite apply its complete NO_PROXY semantics. Its environment parser does
             // not accept HTTPS proxy URLs, but that error occurs only after it decides the target
             // is not bypassed, so retry that case through the explicit TLS-to-proxy path below.
-            match connect_async_tls_with_config(
-                request.clone(),
-                Some(config),
-                disable_nagle,
-                tls_config.clone().map(Connector::Rustls),
-            )
-            .await
-            {
-                Ok((stream, response)) => {
-                    return Ok((ConnectionInner::TransportDefault(stream), response));
-                }
+            let result = if monitor.active() {
+                connect_default_observed(
+                    request.clone(),
+                    config,
+                    tls_config.clone(),
+                    tcp_nodelay,
+                    monitor,
+                )
+                .await
+            } else {
+                connect_async_tls_with_config(
+                    request.clone(),
+                    Some(config),
+                    disable_nagle,
+                    tls_config.clone().map(Connector::Rustls),
+                )
+                .await
+                .map(|(stream, response)| (ConnectionInner::TransportDefault(stream), response))
+            };
+            match result {
+                Ok(connected) => return Ok(connected),
                 Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => Some(url),
                 Err(error) => return Err(error),
             }
@@ -140,6 +154,64 @@ pub(crate) async fn connect(
         }
     };
 
+    let (stream, response) =
+        observed_handshake(request, stream, config, tls_config, monitor).await?;
+    Ok((ConnectionInner::Routed(stream), response))
+}
+
+/// The same parser, proxy handshake, Happy Eyeballs and Nagle ordering as the upstream
+/// default dialer; observations attach to the existing awaits, with no extra I/O.
+async fn connect_default_observed(
+    request: Request,
+    config: WebSocketConfig,
+    tls_config: Option<Arc<ClientConfig>>,
+    tcp_nodelay: TcpNodelay,
+    monitor: &Probe,
+) -> Result<(ConnectionInner, Response), WebSocketError> {
+    let host = websocket_host(&request)?.trim_matches(['[', ']']);
+    let port = websocket_port(&request)?;
+    let proxy = ProxyConfig::from_env(request.uri())?;
+    let address = proxy
+        .as_ref()
+        .map(tokio_tungstenite::tungstenite::proxy::ProxyConfig::authority)
+        .unwrap_or_else(|| format!("{host}:{port}"));
+    let mut socket = connect_observed_tcp(
+        address,
+        TcpNodelay::Default,
+        /*loopback*/ false,
+        monitor,
+    )
+    .await
+    .map_err(WebSocketError::Io)?;
+    if let Some(proxy) = proxy {
+        monitor.update(|s| {
+            s.dns = format!("代理：{}", s.dns);
+            s.tcp = format!("代理 {}", s.tcp);
+        });
+        monitor.phase(Phase::ProxyTunnel);
+        socket = connect_via_proxy(socket, &proxy, host, port).await?;
+    }
+    if tcp_nodelay == TcpNodelay::Enabled {
+        socket.set_nodelay(/*nodelay*/ true)?;
+    }
+    let (stream, response) =
+        observed_handshake(request, socket, config, tls_config, monitor).await?;
+    Ok((ConnectionInner::TransportDefault(stream), response))
+}
+
+async fn observed_handshake<S: AsyncIo + 'static>(
+    request: Request,
+    stream: S,
+    config: WebSocketConfig,
+    tls_config: Option<Arc<ClientConfig>>,
+    monitor: &Probe,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<MaybeTlsStream<S>>,
+        Response,
+    ),
+    WebSocketError,
+> {
     // The explicit Rustls branch uses the very same config and socket; splitting the existing
     // TLS/upgrade await exposes their true boundaries without a probe or a second connection.
     if monitor.active()
@@ -166,10 +238,8 @@ pub(crate) async fn connect(
                 .unwrap_or_else(|| "握手已完成".into())
         });
         monitor.phase(Phase::Upgrade);
-        let stream: Box<dyn AsyncIo> = Box::new(stream);
-        let (stream, response) =
-            client_async_with_config(request, MaybeTlsStream::Plain(stream), Some(config)).await?;
-        return Ok((ConnectionInner::Routed(stream), response));
+        return client_async_with_config(request, MaybeTlsStream::Rustls(stream), Some(config))
+            .await;
     }
     if request.uri().scheme_str() == Some("ws") {
         monitor.update(|s| s.tls = "不使用 TLS".into());
@@ -182,7 +252,7 @@ pub(crate) async fn connect(
         tls_config.map(Connector::Rustls),
     )
     .await?;
-    Ok((ConnectionInner::Routed(stream), response))
+    Ok((stream, response))
 }
 
 async fn connect_observed_tcp(

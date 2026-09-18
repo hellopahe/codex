@@ -25,7 +25,7 @@ if it is not already present. `CODEX_NETWORK_MONITOR=0 codexn` hides the monitor
   connections, response/control activity and time since the last message.
 - Nonempty reasoning/text/tool-argument deltas are timed separately from network
   traffic. Network inactivity never implies that the server is stuck or thinking.
-- Routed WebSockets expose actual DNS resolution, TCP connection, proxy tunnel,
+- Default and routed WebSockets expose actual DNS resolution, TCP connection, proxy tunnel,
   and (with Codex's explicit Rustls configuration) TLS/upgrade boundaries. The
   same socket, TLS configuration and handshake parameters are used.
 - Completed, failed and cancelled requests stop their clocks. Failure retains
@@ -37,9 +37,10 @@ The panel reads the embedded engine's in-process observations. A separately
 running remote/daemon app server has no shared observation registry, and shows
 that no request has been observed in the current process.
 
-Reqwest HTTP connection internals and Tungstenite's delegated/default proxy
-paths do not expose every DNS/TCP/TLS boundary. These fields say `未暴露` instead
-of guessing or probing. A reused WebSocket reports no new DNS resolution.
+Reqwest HTTP connection internals do not expose every DNS/TCP/TLS boundary.
+These fields say `未暴露` instead of guessing or probing. The default WebSocket
+path reuses Tungstenite's own environment-proxy parser and tunnel implementation,
+including NO_PROXY and SOCKS behavior. A reused WebSocket reports no new DNS resolution.
 Byte counters measure HTTP body chunks / WebSocket payloads, not encrypted
 packets, framing overhead or all traffic on a shared socket. The panel clips
 long lines to the terminal width.
