@@ -95,6 +95,7 @@ impl HttpTransport for RecordingTransport {
 
         let stream = futures::stream::iter(Vec::<Result<Bytes, TransportError>>::new());
         Ok(StreamResponse {
+            monitor: codex_http_client::network_monitor::Probe::default(),
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             bytes: Box::pin(stream),
@@ -279,6 +280,7 @@ data: {"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{
         ))]);
 
         Ok(StreamResponse {
+            monitor: codex_http_client::network_monitor::Probe::default(),
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             bytes: Box::pin(stream),

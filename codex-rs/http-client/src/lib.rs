@@ -4,6 +4,7 @@ mod client;
 mod client_builder;
 mod custom_ca;
 mod error;
+pub mod network_monitor;
 mod outbound_proxy;
 mod request;
 mod route_aware_client_pool;

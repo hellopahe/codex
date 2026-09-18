@@ -42,6 +42,7 @@ impl HttpTransport for FixtureSseTransport {
             self.body.clone(),
         ))]);
         Ok(StreamResponse {
+            monitor: codex_http_client::network_monitor::Probe::default(),
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             bytes: Box::pin(stream),

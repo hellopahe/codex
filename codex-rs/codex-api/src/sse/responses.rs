@@ -8,6 +8,8 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_http_client::network_monitor::Phase as NetworkPhase;
+use codex_http_client::network_monitor::Probe as NetworkProbe;
 use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::MisalignmentErrorDetails;
@@ -91,6 +93,7 @@ pub fn spawn_response_stream(
             idle_timeout,
             telemetry,
             safety_buffering_treatment,
+            stream_response.monitor,
         )
         .await;
     });
@@ -191,6 +194,10 @@ where
 }
 
 impl ResponsesStreamEvent {
+    pub(crate) fn has_content_delta(&self) -> bool {
+        self.delta.as_ref().is_some_and(|delta| !delta.is_empty())
+    }
+
     pub fn kind(&self) -> &str {
         &self.kind
     }
@@ -561,6 +568,7 @@ pub async fn process_sse(
         idle_timeout,
         telemetry,
         SafetyBufferingTreatment::default(),
+        NetworkProbe::default(),
     )
     .await;
 }
@@ -571,7 +579,9 @@ async fn process_sse_with_treatment(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
+    monitor: NetworkProbe,
 ) {
+    let _monitor_guard = monitor.guard();
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
@@ -589,11 +599,13 @@ async fn process_sse_with_treatment(
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
+                monitor.finish(NetworkPhase::Failed);
                 debug!("SSE Error: {e:#}");
                 let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
                 return;
             }
             Ok(None) => {
+                monitor.finish(NetworkPhase::Failed);
                 let error = response_error.unwrap_or(ApiError::Stream(
                     "stream closed before response.completed".into(),
                 ));
@@ -601,6 +613,7 @@ async fn process_sse_with_treatment(
                 return;
             }
             Err(_) => {
+                monitor.finish(NetworkPhase::Failed);
                 let _ = tx_event
                     .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
                     .await;
@@ -623,6 +636,9 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
+        if event.has_content_delta() {
+            monitor.content(event.kind());
+        }
         let model_verifications = event.model_verifications();
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
@@ -671,11 +687,13 @@ async fn process_sse_with_treatment(
                     return;
                 }
                 if is_completed {
+                    monitor.finish(NetworkPhase::Complete);
                     return;
                 }
             }
             Ok(None) => {}
             Err(error) => {
+                monitor.finish(NetworkPhase::Failed);
                 response_error = Some(error.into_api_error());
             }
         };
@@ -1502,6 +1520,7 @@ mod tests {
         );
         let bytes = stream::iter(Vec::<Result<Bytes, TransportError>>::new());
         let stream_response = StreamResponse {
+            monitor: codex_http_client::network_monitor::Probe::default(),
             status: StatusCode::OK,
             headers,
             bytes: Box::pin(bytes),
@@ -1542,6 +1561,7 @@ mod tests {
         let sse = format!("event: response.completed\ndata: {completed}\n\n");
         let bytes = stream::iter(vec![Ok(Bytes::from(sse))]);
         let stream_response = StreamResponse {
+            monitor: codex_http_client::network_monitor::Probe::default(),
             status: StatusCode::OK,
             headers,
             bytes: Box::pin(bytes),
