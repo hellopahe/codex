@@ -1,0 +1,7 @@
+---
+source: tui/src/chatwidget/network_monitor_tests.rs
+expression: terminal.backend()
+---
+" "
+" "
+" "

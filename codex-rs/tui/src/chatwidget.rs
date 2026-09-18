@@ -419,6 +419,7 @@ pub(crate) use realtime::realtime_delegation_input;
 pub(crate) use realtime::tests::activate_voice_for_thread;
 mod reasoning_shortcuts;
 use self::realtime::RealtimeConversationUiState;
+mod network_monitor;
 mod rendering;
 mod replay;
 mod review;

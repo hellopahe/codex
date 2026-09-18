@@ -191,6 +191,13 @@ impl ChatWidget {
                 })),
             );
         }
+        if !self.bottom_pane.has_active_view()
+            && let Some(panel) = super::network_monitor::panel(self.thread_id)
+        {
+            self.frame_requester
+                .schedule_frame_in(Duration::from_secs(1));
+            flex.push(/*flex*/ 0, RenderableItem::Owned(Box::new(panel)));
+        }
         let bottom = if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
