@@ -13,6 +13,8 @@ use codex_http_client::BuildCustomCaTransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyRoute;
 use codex_http_client::build_rustls_client_config_with_custom_ca;
+use codex_http_client::network_monitor::Phase;
+use codex_http_client::network_monitor::Probe;
 use futures::FutureExt;
 use futures::Sink;
 use futures::Stream;
@@ -138,6 +140,9 @@ impl WebSocketConnector {
         proxy_route: OutboundProxyRoute,
         loopback_direct: bool,
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
+        let monitor =
+            Probe::from_headers(request.headers(), &request.uri().to_string(), "WebSocket");
+        let _guard = monitor.guard();
         let (inner, response) = dialer::connect(
             request,
             config,
@@ -145,10 +150,22 @@ impl WebSocketConnector {
             proxy_route,
             self.tcp_nodelay,
             loopback_direct,
+            &monitor,
         )
         .boxed()
-        .await?;
-        Ok((WebSocketConnection { inner }, response))
+        .await
+        .inspect_err(|error| {
+            if let WebSocketError::Http(response) = error {
+                monitor.update(|s| s.status = Some(response.status().as_u16()));
+            }
+            monitor.finish(Phase::Failed);
+        })?;
+        monitor.update(|s| {
+            s.status = Some(response.status().as_u16());
+            s.connection = "新连接已就绪".into();
+        });
+        monitor.finish(Phase::Complete);
+        Ok((WebSocketConnection { inner, monitor }, response))
     }
 }
 
@@ -172,6 +189,14 @@ fn is_loopback_destination(uri: &Uri) -> bool {
 /// without knowing which concrete network stream route selection produced.
 pub struct WebSocketConnection {
     inner: ConnectionInner,
+    monitor: Probe,
+}
+
+impl WebSocketConnection {
+    /// Local connection observations, never included in the WebSocket protocol.
+    pub fn network_monitor(&self) -> Probe {
+        self.monitor.clone()
+    }
 }
 
 impl Stream for WebSocketConnection {

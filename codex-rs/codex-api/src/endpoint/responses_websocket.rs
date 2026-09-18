@@ -14,6 +14,8 @@ use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::network_monitor::Phase as NetworkPhase;
+use codex_http_client::network_monitor::Probe as NetworkProbe;
 use codex_websocket_client::WebSocketConnection;
 use codex_websocket_client::WebSocketConnector;
 use futures::SinkExt;
@@ -48,6 +50,8 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 struct WsStream {
+    monitor: NetworkProbe,
+    active_monitor: Arc<std::sync::Mutex<NetworkProbe>>,
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
     pump_task: tokio::task::JoinHandle<()>,
@@ -62,6 +66,9 @@ enum WsCommand {
 
 impl WsStream {
     fn new(inner: WebSocketConnection) -> Self {
+        let monitor = inner.network_monitor();
+        let active_monitor = Arc::new(std::sync::Mutex::new(NetworkProbe::default()));
+        let receive_monitor = active_monitor.clone();
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
         let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
 
@@ -100,6 +107,12 @@ impl WsStream {
                             | Message::Binary(_)
                             | Message::Close(_)
                             | Message::Frame(_))) => {
+                                // Observe arrival before the response consumer can apply backpressure.
+                                if matches!(&message, Message::Text(_) | Message::Binary(_))
+                                    && let Ok(probe) = receive_monitor.lock()
+                                {
+                                    probe.received(message.len());
+                                }
                                 let is_close = matches!(message, Message::Close(_));
                                 if tx_message.send(Ok(message)).is_err() {
                                     break;
@@ -119,6 +132,8 @@ impl WsStream {
         });
 
         Self {
+            monitor,
+            active_monitor,
             tx_command,
             rx_message,
             pump_task,
@@ -693,6 +708,22 @@ async fn run_websocket_response_stream(
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
+    let monitor = ws_stream.monitor.exchange(
+        timing_log_context.thread_id.as_deref().unwrap_or_default(),
+        if timing_log_context.warmup {
+            "连接预热"
+        } else if timing_log_context.connection_reused {
+            "复用 WebSocket"
+        } else {
+            "新 WebSocket"
+        },
+    );
+    let _monitor_guard = monitor.guard();
+    if let Ok(mut active) = ws_stream.active_monitor.lock() {
+        *active = monitor.clone();
+    }
+    monitor.update(|s| s.sent_bytes = request_text.len());
+    monitor.phase(NetworkPhase::Sending);
     send_websocket_request(
         ws_stream,
         request_text,
@@ -700,7 +731,9 @@ async fn run_websocket_response_stream(
         telemetry.as_ref(),
         timing_log_context.connection_reused,
     )
-    .await?;
+    .await
+    .inspect_err(|_| monitor.finish(NetworkPhase::Failed))?;
+    monitor.local_send_complete();
 
     loop {
         let poll_start = Instant::now();
@@ -713,14 +746,17 @@ async fn run_websocket_response_stream(
         let message = match response {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
+                monitor.finish(NetworkPhase::Failed);
                 return Err(ApiError::Stream(err.to_string()));
             }
             Ok(None) => {
+                monitor.finish(NetworkPhase::Failed);
                 return Err(ApiError::Stream(
                     "stream closed before response.completed".into(),
                 ));
             }
             Err(err) => {
+                monitor.finish(NetworkPhase::Failed);
                 return Err(err);
             }
         };
@@ -731,6 +767,7 @@ async fn run_websocket_response_stream(
                     && let Some(error) =
                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
                 {
+                    monitor.finish(NetworkPhase::Failed);
                     return Err(error);
                 }
 
@@ -741,6 +778,9 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
+                if event.has_content_delta() {
+                    monitor.content(event.kind());
+                }
                 emit_responses_websocket_timing_event(
                     event.kind(),
                     text.as_str(),
@@ -824,14 +864,17 @@ async fn run_websocket_response_stream(
                     }
                     Ok(None) => {}
                     Err(error) => {
+                        monitor.finish(NetworkPhase::Failed);
                         return Err(error.into_api_error());
                     }
                 }
             }
             Message::Binary(_) => {
+                monitor.finish(NetworkPhase::Failed);
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
             Message::Close(_) => {
+                monitor.finish(NetworkPhase::Failed);
                 return Err(ApiError::Stream(
                     "websocket closed by server before response.completed".into(),
                 ));
@@ -841,6 +884,7 @@ async fn run_websocket_response_stream(
         }
     }
 
+    monitor.finish(NetworkPhase::Complete);
     Ok(())
 }
 

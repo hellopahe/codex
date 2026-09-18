@@ -188,6 +188,12 @@ async fn direct_route_connects_secure_websocket() {
         .into_client_request()
         .expect("websocket request should build");
 
+    let mut monitor_headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+    monitor_headers.insert(
+        "thread-id",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("direct-tls-monitor"),
+    );
+    let monitor = Probe::from_headers(&monitor_headers, "wss://localhost", "WebSocket");
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
@@ -195,10 +201,20 @@ async fn direct_route_connects_secure_websocket() {
         OutboundProxyRoute::Direct,
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
+        &monitor,
     )
     .await
     .expect("direct websocket handshake should succeed");
-    drop(WebSocketConnection { inner });
+    if monitor.active() {
+        let observed = codex_http_client::network_monitor::snapshot("direct-tls-monitor").unwrap();
+        assert_eq!(observed.phase, Phase::Upgrade);
+        assert!(observed.tls.contains("TLSv1_3"));
+        assert!(observed.tcp.contains("127.0.0.1") || observed.tcp.contains("[::1]"));
+    }
+    drop(WebSocketConnection {
+        inner,
+        monitor: Probe::default(),
+    });
 
     target_task.await.expect("target task should finish");
 }
@@ -283,10 +299,14 @@ async fn no_proxy_subprocess_probe() {
         },
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
+        &Probe::default(),
     )
     .await
     .expect("websocket handshake should succeed");
-    let mut websocket = WebSocketConnection { inner };
+    let mut websocket = WebSocketConnection {
+        inner,
+        monitor: Probe::default(),
+    };
     websocket
         .send(Message::Text("probe".into()))
         .await
@@ -632,6 +652,17 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
     let request = format!("wss://{target_authority}/v1/responses")
         .into_client_request()
         .expect("websocket request should build");
+    let thread_id = if proxy_tls {
+        "https-proxy-monitor"
+    } else {
+        "http-proxy-monitor"
+    };
+    let mut headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+    headers.insert(
+        "thread-id",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(thread_id),
+    );
+    let monitor = Probe::from_headers(&headers, "wss://localhost", "WebSocket");
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
@@ -642,10 +673,20 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
         },
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
+        &monitor,
     )
     .await
     .expect("proxied websocket handshake should succeed");
-    drop(WebSocketConnection { inner });
+    if monitor.active() {
+        let observed = codex_http_client::network_monitor::snapshot(thread_id).unwrap();
+        assert_eq!(observed.phase, Phase::Upgrade);
+        assert!(observed.tls.contains("TLSv1_3"));
+        assert!(observed.tcp.starts_with("代理 "));
+    }
+    drop(WebSocketConnection {
+        inner,
+        monitor: Probe::default(),
+    });
 
     target_task.await.expect("target task should finish");
     proxy_task.await.expect("proxy task should finish");

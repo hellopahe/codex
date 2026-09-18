@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use codex_http_client::OutboundProxyRoute;
 use codex_http_client::build_rustls_client_config_with_custom_ca;
+use codex_http_client::network_monitor::Phase;
+use codex_http_client::network_monitor::Probe;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rustls::ClientConfig;
@@ -16,7 +18,9 @@ use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
@@ -40,6 +44,7 @@ pub(crate) async fn connect(
     proxy_route: OutboundProxyRoute,
     tcp_nodelay: TcpNodelay,
     loopback_direct: bool,
+    monitor: &Probe,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
     let proxy_url = match proxy_route {
@@ -90,9 +95,9 @@ pub(crate) async fn connect(
             let port = websocket_port(&request)?;
             let address = host_port(host, port);
             let stream = if loopback_direct {
-                connect_loopback_tcp(address, tcp_nodelay).await
+                connect_observed_tcp(address, tcp_nodelay, /*loopback*/ true, monitor).await
             } else {
-                connect_tcp(address, tcp_nodelay).await
+                connect_observed_tcp(address, tcp_nodelay, /*loopback*/ false, monitor).await
             }
             .map_err(WebSocketError::Io)?;
             Box::new(stream)
@@ -101,10 +106,20 @@ pub(crate) async fn connect(
             let proxy = ProxyEndpoint::parse(&url)?;
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let stream = connect_tcp(proxy.config.authority(), tcp_nodelay)
-                .await
-                .map_err(WebSocketError::Io)?;
+            let stream = connect_observed_tcp(
+                proxy.config.authority(),
+                tcp_nodelay,
+                /*loopback*/ false,
+                monitor,
+            )
+            .await
+            .map_err(WebSocketError::Io)?;
+            monitor.update(|s| {
+                s.dns = format!("代理：{}", s.dns);
+                s.tcp = format!("代理 {}", s.tcp);
+            });
             let stream: Box<dyn AsyncIo> = if proxy.tls {
+                monitor.phase(Phase::ProxyTls);
                 let proxy_tls_config = match &tls_config {
                     Some(tls_config) => Arc::clone(tls_config),
                     None => build_rustls_client_config_with_custom_ca()
@@ -120,10 +135,46 @@ pub(crate) async fn connect(
             } else {
                 Box::new(stream)
             };
+            monitor.phase(Phase::ProxyTunnel);
             connect_via_proxy(stream, &proxy.config, host, port).await?
         }
     };
 
+    // The explicit Rustls branch uses the very same config and socket; splitting the existing
+    // TLS/upgrade await exposes their true boundaries without a probe or a second connection.
+    if monitor.active()
+        && request.uri().scheme_str() == Some("wss")
+        && let Some(tls) = &tls_config
+    {
+        let host = websocket_host(&request)?
+            .trim_matches(['[', ']'])
+            .to_owned();
+        let name = ServerName::try_from(host)
+            .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
+        monitor.phase(Phase::Tls);
+        monitor.update(|s| s.tls = "握手中".into());
+        let stream = TlsConnector::from(tls.clone())
+            .connect(name, stream)
+            .await
+            .map_err(WebSocketError::Io)?;
+        monitor.update(|s| {
+            s.tls = stream
+                .get_ref()
+                .1
+                .protocol_version()
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "握手已完成".into())
+        });
+        monitor.phase(Phase::Upgrade);
+        let stream: Box<dyn AsyncIo> = Box::new(stream);
+        let (stream, response) =
+            client_async_with_config(request, MaybeTlsStream::Plain(stream), Some(config)).await?;
+        return Ok((ConnectionInner::Routed(stream), response));
+    }
+    if request.uri().scheme_str() == Some("ws") {
+        monitor.update(|s| s.tls = "不使用 TLS".into());
+        monitor.phase(Phase::Upgrade);
+    }
     let (stream, response) = client_async_tls_with_config(
         request,
         stream,
@@ -132,6 +183,39 @@ pub(crate) async fn connect(
     )
     .await?;
     Ok((ConnectionInner::Routed(stream), response))
+}
+
+async fn connect_observed_tcp(
+    address: String,
+    tcp_nodelay: TcpNodelay,
+    loopback: bool,
+    monitor: &Probe,
+) -> io::Result<TcpStream> {
+    if !monitor.active() {
+        return if loopback {
+            connect_loopback_tcp(address, tcp_nodelay).await
+        } else {
+            connect_tcp(address, tcp_nodelay).await
+        };
+    }
+    monitor.phase(Phase::Dns);
+    monitor.update(|s| s.dns = "解析中".into());
+    let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+    monitor.update(|s| s.dns = format!("已解析 {} 个地址", addresses.len()));
+    monitor.phase(Phase::Tcp);
+    let addresses = if loopback {
+        loopback_addresses(addresses)?
+    } else {
+        addresses
+    };
+    let stream = connect_resolved_tcp(addresses, tcp_nodelay).await?;
+    monitor.update(|s| {
+        s.tcp = stream
+            .peer_addr()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| "已连接".into())
+    });
+    Ok(stream)
 }
 
 #[derive(Debug, PartialEq, Eq)]
