@@ -8,10 +8,37 @@ retry policy, timeouts, proxy selection or certificate verification.
 ## Install and run
 
 Build and install with `scripts/install-codexn.sh`, then run `codexn` with the
-same arguments as `codex`. The executable is installed to
-`~/.local/lib/codexn/codex`; the launcher is `~/.local/bin/codexn`.
+same arguments as `codex`. The installer requires Python 3.11+, Cargo, Bazel,
+and the complete official package for the same version and platform. It locates
+that package from `codex` on PATH; `--official-package PATH` overrides discovery.
+The launcher is `~/.local/bin/codexn`; immutable packages are installed under
+`~/.local/lib/codexn/releases`, selected by the atomic `current` symlink.
 The official `codex` command is never replaced. Add `~/.local/bin` to your PATH
 if it is not already present. `CODEX_NETWORK_MONITOR=0 codexn` hides the monitor.
+
+The full package is required: Code Mode runs in `bin/codex-code-mode-host`,
+search uses `codex-path/rg`, and packaged zsh and voice resources live under
+`codex-resources`. Installing just `bin/codex` loses these resources. Every
+official package file is copied, including future additions. The installer
+replaces the main executable and voice host, stamps both with the fork's source
+commit, and regenerates the voice checksum manifest. The Code Mode host, patched
+zsh, rg, native voice libraries and their licenses remain byte-for-byte identical
+to the matching official package. Voice libraries must match this repository's
+pinned dependency source manifest.
+
+Before activation, the installer verifies the complete file inventory and hashes,
+queries the main executable's compiled build identity through its local executor,
+executes JavaScript in the Code Mode host, and exercises the voice handshake,
+private runtime initialization and WebRTC offer creation. These checks use an
+isolated Codex home, no model endpoint, and no microphone or speaker capture.
+A missing component, mismatched build, or failed check leaves the current
+installation selected. Each release contains `codexn-build-info.json` with source
+provenance, checksums and validation results.
+
+To install an already-built pair, pass `--from-binary PATH --voice-host PATH
+--build-commit FULL_SHA`. Both binaries must carry that commit. Existing running
+processes retain their original executable and cached resource discovery; resume
+their sessions in a new `codexn` process to use a newly installed package.
 
 ## What the panel measures
 
@@ -62,3 +89,13 @@ just test -p codex-api -p codex-tui
 
 Tests exercise request isolation, cancellation, connection reuse, URL redaction,
 real loopback HTTP byte counting, TLS connections, and terminal snapshots.
+
+Installer regression checks:
+
+```sh
+python3 -m unittest discover -s scripts -p test_install_codexn.py -v
+```
+
+They cover complete resource preservation, missing Code Mode hosts, corrupted
+voice libraries, version/build mismatches, corrupt existing releases, and keeping
+the previous installation selected when runtime checks fail.
